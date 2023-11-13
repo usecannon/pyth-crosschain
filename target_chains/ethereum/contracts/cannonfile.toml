@@ -1,0 +1,5 @@
+name = "pyth"
+version = "1.4.0"
+
+[contract.Pyth]
+artifact = "PythMock"
