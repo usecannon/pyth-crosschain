@@ -1,5 +1,12 @@
 name = "pyth"
 version = "1.4.0"
 
+[setting.validTimePeriod]
+defaultValue = "300"
+
+[setting.singleUpdateFeeInWei]
+defaultValue = "0"
+
 [contract.Pyth]
 artifact = "PythMock"
+args = ["<%= settings.validTimePeriod %>", "<%= settings.singleUpdateFeeInWei %>"]
