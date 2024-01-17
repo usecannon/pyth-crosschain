@@ -4,35 +4,49 @@ pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
 import "@pythnetwork/entropy-sdk-solidity/EntropyStructs.sol";
-import "../contracts/entropy/Entropy.sol";
+import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import "./utils/EntropyTestUtils.t.sol";
+import "../contracts/entropy/EntropyUpgradable.sol";
 
 // TODO
-// - what's the impact of # of in-flight requests on gas usage? More requests => more hashes to
-//   verify the provider's value.
 // - fuzz test?
-contract EntropyTest is Test {
-    Entropy public random;
+contract EntropyTest is Test, EntropyTestUtils {
+    ERC1967Proxy public proxy;
+    EntropyUpgradable public random;
 
-    uint pythFeeInWei = 7;
+    uint128 pythFeeInWei = 7;
 
     address public provider1 = address(1);
     bytes32[] provider1Proofs;
-    uint provider1FeeInWei = 8;
+    uint128 provider1FeeInWei = 8;
     uint64 provider1ChainLength = 100;
+    bytes provider1Uri = bytes("https://foo.com");
+    bytes provider1CommitmentMetadata = hex"0100";
 
     address public provider2 = address(2);
     bytes32[] provider2Proofs;
-    uint provider2FeeInWei = 20;
+    uint128 provider2FeeInWei = 20;
+    bytes provider2Uri = bytes("https://bar.com");
 
     address public user1 = address(3);
     address public user2 = address(4);
 
     address public unregisteredProvider = address(7);
-    uint256 MAX_UINT256 = 2 ** 256 - 1;
+    uint128 MAX_UINT128 = 2 ** 128 - 1;
     bytes32 ALL_ZEROS = bytes32(uint256(0));
 
+    address public owner = address(8);
+    address public admin = address(9);
+    address public admin2 = address(10);
+
     function setUp() public {
-        random = new Entropy(pythFeeInWei);
+        EntropyUpgradable _random = new EntropyUpgradable();
+        // deploy proxy contract and point it to implementation
+        proxy = new ERC1967Proxy(address(_random), "");
+        // wrap in ABI to support easier calls
+        random = EntropyUpgradable(address(proxy));
+
+        random.initialize(owner, admin, pythFeeInWei, provider1, false);
 
         bytes32[] memory hashChain1 = generateHashChain(
             provider1,
@@ -44,8 +58,9 @@ contract EntropyTest is Test {
         random.register(
             provider1FeeInWei,
             provider1Proofs[0],
-            bytes32(keccak256(abi.encodePacked(uint256(0x0100)))),
-            provider1ChainLength
+            provider1CommitmentMetadata,
+            provider1ChainLength,
+            provider1Uri
         );
 
         bytes32[] memory hashChain2 = generateHashChain(provider2, 0, 100);
@@ -54,22 +69,10 @@ contract EntropyTest is Test {
         random.register(
             provider2FeeInWei,
             provider2Proofs[0],
-            bytes32(keccak256(abi.encodePacked(uint256(0x0200)))),
-            100
+            hex"0200",
+            100,
+            provider2Uri
         );
-    }
-
-    function generateHashChain(
-        address provider,
-        uint64 startSequenceNumber,
-        uint64 size
-    ) public pure returns (bytes32[] memory hashChain) {
-        bytes32 initialValue = keccak256(abi.encodePacked(startSequenceNumber));
-        hashChain = new bytes32[](size);
-        for (uint64 i = 0; i < size; i++) {
-            hashChain[size - (i + 1)] = initialValue;
-            initialValue = keccak256(bytes.concat(initialValue));
-        }
     }
 
     // Test helper method for requesting a random value as user from provider.
@@ -96,12 +99,13 @@ contract EntropyTest is Test {
         bool useBlockhash
     ) public returns (uint64 sequenceNumber) {
         vm.deal(user, fee);
-        vm.prank(user);
+        vm.startPrank(user);
         sequenceNumber = random.request{value: fee}(
             provider,
             random.constructUserCommitment(bytes32(randomNumber)),
             useBlockhash
         );
+        vm.stopPrank();
     }
 
     function assertRequestReverts(
@@ -130,12 +134,14 @@ contract EntropyTest is Test {
     }
 
     function assertRevealSucceeds(
+        address user,
         address provider,
         uint64 sequenceNumber,
         uint userRandom,
         bytes32 providerRevelation,
         bytes32 hash
     ) public {
+        vm.prank(user);
         bytes32 randomNumber = random.reveal(
             provider,
             sequenceNumber,
@@ -153,11 +159,13 @@ contract EntropyTest is Test {
     }
 
     function assertRevealReverts(
+        address user,
         address provider,
         uint64 sequenceNumber,
         uint userRandom,
         bytes32 providerRevelation
     ) public {
+        vm.startPrank(user);
         vm.expectRevert();
         random.reveal(
             provider,
@@ -165,6 +173,7 @@ contract EntropyTest is Test {
             bytes32(uint256(userRandom)),
             providerRevelation
         );
+        vm.stopPrank();
     }
 
     function assertInvariants() public {
@@ -196,10 +205,16 @@ contract EntropyTest is Test {
     }
 
     function testBasicFlow() public {
+        vm.roll(17);
         uint64 sequenceNumber = request(user2, provider1, 42, false);
-        assertEq(random.getRequest(provider1, sequenceNumber).blockNumber, 0);
+        assertEq(random.getRequest(provider1, sequenceNumber).blockNumber, 17);
+        assertEq(
+            random.getRequest(provider1, sequenceNumber).useBlockhash,
+            false
+        );
 
         assertRevealSucceeds(
+            user2,
             provider1,
             sequenceNumber,
             42,
@@ -210,6 +225,7 @@ contract EntropyTest is Test {
         // You can only reveal the random number once. This isn't a feature of the contract per se, but it is
         // the expected behavior.
         assertRevealReverts(
+            user2,
             provider1,
             sequenceNumber,
             42,
@@ -217,8 +233,63 @@ contract EntropyTest is Test {
         );
     }
 
+    function testDefaultProvider() public {
+        vm.roll(20);
+        uint64 sequenceNumber = request(
+            user2,
+            random.getDefaultProvider(),
+            42,
+            false
+        );
+        assertEq(random.getRequest(provider1, sequenceNumber).blockNumber, 20);
+        assertEq(
+            random.getRequest(provider1, sequenceNumber).useBlockhash,
+            false
+        );
+
+        assertRevealReverts(
+            user2,
+            random.getDefaultProvider(),
+            sequenceNumber,
+            42,
+            provider2Proofs[sequenceNumber]
+        );
+
+        assertRevealSucceeds(
+            user2,
+            random.getDefaultProvider(),
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber],
+            ALL_ZEROS
+        );
+    }
+
     function testNoSuchProvider() public {
         assertRequestReverts(10000000, unregisteredProvider, 42, false);
+    }
+
+    function testAuthorization() public {
+        uint64 sequenceNumber = request(user2, provider1, 42, false);
+        assertEq(random.getRequest(provider1, sequenceNumber).requester, user2);
+
+        // user1 not authorized, must be user2.
+        assertRevealReverts(
+            user1,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber]
+        );
+
+        assertRevealSucceeds(
+            user2,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber],
+            ALL_ZEROS
+        );
     }
 
     function testAdversarialReveal() public {
@@ -228,6 +299,7 @@ contract EntropyTest is Test {
         for (uint256 i = 0; i < 10; i++) {
             if (i != sequenceNumber) {
                 assertRevealReverts(
+                    user2,
                     provider1,
                     sequenceNumber,
                     42,
@@ -239,6 +311,7 @@ contract EntropyTest is Test {
         // test revealing with the wrong user revealed value.
         for (uint256 i = 0; i < 42; i++) {
             assertRevealReverts(
+                user2,
                 provider1,
                 sequenceNumber,
                 i,
@@ -249,13 +322,14 @@ contract EntropyTest is Test {
         // test revealing sequence numbers that haven't been requested yet.
         for (uint64 i = sequenceNumber + 1; i < sequenceNumber + 3; i++) {
             assertRevealReverts(
+                user2,
                 provider1,
                 i,
                 42,
                 provider1Proofs[sequenceNumber]
             );
 
-            assertRevealReverts(provider1, i, 42, provider1Proofs[i]);
+            assertRevealReverts(user2, provider1, i, 42, provider1Proofs[i]);
         }
     }
 
@@ -265,21 +339,56 @@ contract EntropyTest is Test {
         uint64 s3 = request(user1, provider1, 3, false);
         uint64 s4 = request(user1, provider1, 4, false);
 
-        assertRevealSucceeds(provider1, s3, 3, provider1Proofs[s3], ALL_ZEROS);
+        assertRevealSucceeds(
+            user1,
+            provider1,
+            s3,
+            3,
+            provider1Proofs[s3],
+            ALL_ZEROS
+        );
         assertInvariants();
 
         uint64 s5 = request(user1, provider1, 5, false);
 
-        assertRevealSucceeds(provider1, s4, 4, provider1Proofs[s4], ALL_ZEROS);
+        assertRevealSucceeds(
+            user1,
+            provider1,
+            s4,
+            4,
+            provider1Proofs[s4],
+            ALL_ZEROS
+        );
         assertInvariants();
 
-        assertRevealSucceeds(provider1, s1, 1, provider1Proofs[s1], ALL_ZEROS);
+        assertRevealSucceeds(
+            user1,
+            provider1,
+            s1,
+            1,
+            provider1Proofs[s1],
+            ALL_ZEROS
+        );
         assertInvariants();
 
-        assertRevealSucceeds(provider1, s2, 2, provider1Proofs[s2], ALL_ZEROS);
+        assertRevealSucceeds(
+            user2,
+            provider1,
+            s2,
+            2,
+            provider1Proofs[s2],
+            ALL_ZEROS
+        );
         assertInvariants();
 
-        assertRevealSucceeds(provider1, s5, 5, provider1Proofs[s5], ALL_ZEROS);
+        assertRevealSucceeds(
+            user1,
+            provider1,
+            s5,
+            5,
+            provider1Proofs[s5],
+            ALL_ZEROS
+        );
         assertInvariants();
     }
 
@@ -291,22 +400,93 @@ contract EntropyTest is Test {
             random.getRequest(provider1, sequenceNumber).blockNumber,
             1234
         );
+        assertEq(
+            random.getRequest(provider1, sequenceNumber).useBlockhash,
+            true
+        );
 
+        vm.roll(1235);
         assertRevealSucceeds(
+            user2,
             provider1,
             sequenceNumber,
             42,
             provider1Proofs[sequenceNumber],
             blockhash(1234)
         );
+    }
 
-        // You can only reveal the random number once. This isn't a feature of the contract per se, but it is
-        // the expected behavior.
+    function testNoCheckOnBlockNumberWhenNoBlockHashUsed() public {
+        vm.roll(1234);
+        uint64 sequenceNumber = request(user2, provider1, 42, false);
+
+        vm.roll(1236);
+        assertRevealSucceeds(
+            user2,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber],
+            ALL_ZEROS
+        );
+
+        vm.roll(1234);
+        sequenceNumber = request(user2, provider1, 42, false);
+
+        vm.roll(1234);
+        assertRevealSucceeds(
+            user2,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber],
+            ALL_ZEROS
+        );
+
+        vm.roll(1234);
+        sequenceNumber = request(user2, provider1, 42, false);
+
+        vm.roll(1234 + 257);
+        assertRevealSucceeds(
+            user2,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber],
+            ALL_ZEROS
+        );
+    }
+
+    function testCheckOnBlockNumberWhenBlockHashUsed() public {
+        vm.roll(1234);
+        uint64 sequenceNumber = request(user2, provider1, 42, true);
+
+        vm.roll(1234);
         assertRevealReverts(
+            user2,
             provider1,
             sequenceNumber,
             42,
             provider1Proofs[sequenceNumber]
+        );
+
+        vm.roll(1234 + 257);
+        assertRevealReverts(
+            user2,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber]
+        );
+
+        vm.roll(1235);
+        assertRevealSucceeds(
+            user2,
+            provider1,
+            sequenceNumber,
+            42,
+            provider1Proofs[sequenceNumber],
+            blockhash(1234)
         );
     }
 
@@ -326,8 +506,9 @@ contract EntropyTest is Test {
         random.register(
             provider1FeeInWei,
             newHashChain[0],
-            bytes32(keccak256(abi.encodePacked(uint256(0x0100)))),
-            10
+            hex"0100",
+            10,
+            provider1Uri
         );
         assertInvariants();
         EntropyStructs.ProviderInfo memory info1 = random.getProviderInfo(
@@ -342,6 +523,7 @@ contract EntropyTest is Test {
         // Requests that were in-flight at the time of rotation use the commitment from the time of request
         for (uint256 i = 0; i < 10; i++) {
             assertRevealReverts(
+                user2,
                 provider1,
                 sequenceNumber1,
                 userRandom,
@@ -349,6 +531,7 @@ contract EntropyTest is Test {
             );
         }
         assertRevealSucceeds(
+            user2,
             provider1,
             sequenceNumber1,
             userRandom,
@@ -359,12 +542,14 @@ contract EntropyTest is Test {
 
         // Requests after the rotation use the new commitment
         assertRevealReverts(
+            user2,
             provider1,
             sequenceNumber3,
             userRandom,
             provider1Proofs[sequenceNumber3]
         );
         assertRevealSucceeds(
+            user2,
             provider1,
             sequenceNumber3,
             userRandom,
@@ -398,13 +583,28 @@ contract EntropyTest is Test {
         // Check that overflowing the fee arithmetic causes the transaction to revert.
         vm.prank(provider1);
         random.register(
-            MAX_UINT256,
+            MAX_UINT128,
             provider1Proofs[0],
-            bytes32(keccak256(abi.encodePacked(uint256(0x0100)))),
-            100
+            hex"0100",
+            100,
+            provider1Uri
         );
         vm.expectRevert();
         random.getFee(provider1);
+    }
+
+    function testOverflow() public {
+        // msg.value overflows the uint128 fee variable
+        assertRequestReverts(2 ** 128, provider1, 42, false);
+
+        // block number is too large
+        vm.roll(2 ** 96);
+        assertRequestReverts(
+            pythFeeInWei + provider1FeeInWei,
+            provider1,
+            42,
+            true
+        );
     }
 
     function testFees() public {
@@ -455,14 +655,15 @@ contract EntropyTest is Test {
         random.register(
             12345,
             provider1Proofs[0],
-            bytes32(keccak256(abi.encodePacked(uint256(0x0100)))),
-            100
+            hex"0100",
+            100,
+            provider1Uri
         );
 
         assertRequestReverts(pythFeeInWei + 12345 - 1, provider1, 42, false);
         requestWithFee(user2, pythFeeInWei + 12345, provider1, 42, false);
 
-        uint providerOneBalance = provider1FeeInWei * 3 + 12345;
+        uint128 providerOneBalance = provider1FeeInWei * 3 + 12345;
         assertEq(
             random.getProviderInfo(provider1).accruedFeesInWei,
             providerOneBalance
@@ -485,5 +686,14 @@ contract EntropyTest is Test {
         vm.prank(provider1);
         vm.expectRevert();
         random.withdraw(providerOneBalance);
+    }
+
+    function testGetProviderInfo() public {
+        EntropyStructs.ProviderInfo memory providerInfo1 = random
+            .getProviderInfo(provider1);
+        // These two fields aren't used by the Entropy contract itself -- they're just convenient info to store
+        // on-chain -- so they aren't tested in the other tests.
+        assertEq(providerInfo1.uri, provider1Uri);
+        assertEq(providerInfo1.commitmentMetadata, provider1CommitmentMetadata);
     }
 }

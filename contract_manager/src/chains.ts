@@ -1,4 +1,4 @@
-import { KeyValueConfig, PrivateKey, Storable } from "./base";
+import { KeyValueConfig, PrivateKey, Storable, TxResult } from "./base";
 import {
   ChainName,
   SetFee,
@@ -12,7 +12,7 @@ import {
   DataSource,
   EvmSetWormholeAddress,
 } from "xc_admin_common";
-import { AptosClient } from "aptos";
+import { AptosClient, AptosAccount, CoinClient, TxnBuilderTypes } from "aptos";
 import Web3 from "web3";
 import {
   CosmwasmExecutor,
@@ -20,6 +20,12 @@ import {
   InjectiveExecutor,
 } from "@pythnetwork/cosmwasm-deploy-tools";
 import { Network } from "@injectivelabs/networks";
+import {
+  Connection,
+  Ed25519Keypair,
+  JsonRpcProvider,
+  RawSigner,
+} from "@mysten/sui.js";
 
 export type ChainConfig = Record<string, string> & {
   mainnet: boolean;
@@ -47,6 +53,10 @@ export abstract class Chain extends Storable {
       throw new Error(
         `Invalid chain name ${wormholeChainName}. Try rebuilding xc_admin_common package`
       );
+  }
+
+  public getWormholeChainId(): number {
+    return toChainId(this.wormholeChainName);
   }
 
   getId(): string {
@@ -96,17 +106,42 @@ export abstract class Chain extends Storable {
    * @param upgradeInfo based on the contract type, this can be a contract address, codeId, package digest, etc.
    */
   abstract generateGovernanceUpgradePayload(upgradeInfo: unknown): Buffer;
+
+  /**
+   * Returns the account address associated with the given private key.
+   * @param privateKey the account private key
+   */
+  abstract getAccountAddress(privateKey: PrivateKey): Promise<string>;
+
+  /**
+   * Returns the balance of the account associated with the given private key.
+   * @param privateKey the account private key
+   */
+  abstract getAccountBalance(privateKey: PrivateKey): Promise<number>;
 }
 
+/**
+ * A Chain object that represents all chains. This is used for governance instructions that apply to all chains.
+ * For example, governance instructions to upgrade Pyth data sources.
+ */
 export class GlobalChain extends Chain {
   static type = "GlobalChain";
   constructor() {
     super("global", true, "unset");
   }
+
   generateGovernanceUpgradePayload(): Buffer {
     throw new Error(
       "Can not create a governance message for upgrading contracts on all chains!"
     );
+  }
+
+  async getAccountAddress(_privateKey: PrivateKey): Promise<string> {
+    throw new Error("Can not get account for GlobalChain.");
+  }
+
+  async getAccountBalance(_privateKey: PrivateKey): Promise<number> {
+    throw new Error("Can not get account balance for GlobalChain.");
   }
 
   getType(): string {
@@ -177,7 +212,9 @@ export class CosmWasmChain extends Chain {
     return new CosmosUpgradeContract(this.wormholeChainName, codeId).encode();
   }
 
-  async getExecutor(privateKey: PrivateKey) {
+  async getExecutor(
+    privateKey: PrivateKey
+  ): Promise<CosmwasmExecutor | InjectiveExecutor> {
     if (this.getId().indexOf("injective") > -1) {
       return InjectiveExecutor.fromPrivateKey(
         this.isMainnet() ? Network.Mainnet : Network.Testnet,
@@ -189,6 +226,20 @@ export class CosmWasmChain extends Chain {
       await CosmwasmExecutor.getSignerFromPrivateKey(privateKey, this.prefix),
       this.gasPrice + this.feeDenom
     );
+  }
+
+  async getAccountAddress(privateKey: PrivateKey): Promise<string> {
+    const executor = await this.getExecutor(privateKey);
+    if (executor instanceof InjectiveExecutor) {
+      return executor.getAddress();
+    } else {
+      return await executor.getAddress();
+    }
+  }
+
+  async getAccountBalance(privateKey: PrivateKey): Promise<number> {
+    const executor = await this.getExecutor(privateKey);
+    return await executor.getBalance();
   }
 }
 
@@ -238,6 +289,27 @@ export class SuiChain extends Chain {
       digest
     ).encode();
   }
+
+  getProvider(): JsonRpcProvider {
+    return new JsonRpcProvider(new Connection({ fullnode: this.rpcUrl }));
+  }
+
+  async getAccountAddress(privateKey: PrivateKey): Promise<string> {
+    const provider = this.getProvider();
+    const keypair = Ed25519Keypair.fromSecretKey(
+      Buffer.from(privateKey, "hex")
+    );
+    const wallet = new RawSigner(keypair, provider);
+    return await wallet.getAddress();
+  }
+
+  async getAccountBalance(privateKey: PrivateKey): Promise<number> {
+    const provider = this.getProvider();
+    const balance = await provider.getBalance({
+      owner: await this.getAccountAddress(privateKey),
+    });
+    return Number(balance.totalBalance) / 10 ** 9;
+  }
 }
 
 export class EvmChain extends Chain {
@@ -246,11 +318,11 @@ export class EvmChain extends Chain {
   constructor(
     id: string,
     mainnet: boolean,
-    wormholeChainName: string,
     private rpcUrl: string,
     private networkId: number
   ) {
-    super(id, mainnet, wormholeChainName);
+    // On EVM networks we use the chain id as the wormhole chain name
+    super(id, mainnet, id);
   }
 
   static fromJson(parsed: ChainConfig & { networkId: number }): EvmChain {
@@ -258,7 +330,6 @@ export class EvmChain extends Chain {
     return new EvmChain(
       parsed.id,
       parsed.mainnet,
-      parsed.wormholeChainName,
       parsed.rpcUrl,
       parsed.networkId
     );
@@ -299,7 +370,6 @@ export class EvmChain extends Chain {
   toJson(): KeyValueConfig {
     return {
       id: this.id,
-      wormholeChainName: this.wormholeChainName,
       mainnet: this.mainnet,
       rpcUrl: this.rpcUrl,
       networkId: this.networkId,
@@ -326,7 +396,7 @@ export class EvmChain extends Chain {
    * @param privateKey hex string of the 32 byte private key without the 0x prefix
    * @param abi the abi of the contract, can be obtained from the compiled contract json file
    * @param bytecode bytecode of the contract, can be obtained from the compiled contract json file
-   * @param deployArgs arguments to pass to the constructor
+   * @param deployArgs arguments to pass to the constructor. Each argument must begin with 0x if it's a hex string
    * @returns the address of the deployed contract
    */
   async deploy(
@@ -360,6 +430,20 @@ export class EvmChain extends Chain {
       gasPrice,
     });
     return deployedContract.options.address;
+  }
+
+  async getAccountAddress(privateKey: PrivateKey): Promise<string> {
+    const web3 = new Web3(this.getRpcUrl());
+    const signer = web3.eth.accounts.privateKeyToAccount(privateKey);
+    return signer.address;
+  }
+
+  async getAccountBalance(privateKey: PrivateKey): Promise<number> {
+    const web3 = new Web3(this.getRpcUrl());
+    const balance = await web3.eth.getBalance(
+      await this.getAccountAddress(privateKey)
+    );
+    return Number(balance) / 10 ** 18;
   }
 }
 
@@ -412,5 +496,39 @@ export class AptosChain extends Chain {
       parsed.wormholeChainName,
       parsed.rpcUrl
     );
+  }
+
+  async getAccountAddress(privateKey: PrivateKey): Promise<string> {
+    const account = new AptosAccount(
+      new Uint8Array(Buffer.from(privateKey, "hex"))
+    );
+    return account.address().toString();
+  }
+
+  async getAccountBalance(privateKey: PrivateKey): Promise<number> {
+    const client = this.getClient();
+    const account = new AptosAccount(
+      new Uint8Array(Buffer.from(privateKey, "hex"))
+    );
+    const coinClient = new CoinClient(client);
+    return Number(await coinClient.checkBalance(account)) / 10 ** 8;
+  }
+
+  async sendTransaction(
+    senderPrivateKey: PrivateKey,
+    txPayload: TxnBuilderTypes.TransactionPayloadEntryFunction
+  ): Promise<TxResult> {
+    const client = this.getClient();
+    const sender = new AptosAccount(
+      new Uint8Array(Buffer.from(senderPrivateKey, "hex"))
+    );
+    const result = await client.generateSignSubmitWaitForTransaction(
+      sender,
+      txPayload,
+      {
+        maxGasAmount: BigInt(30000),
+      }
+    );
+    return { id: result.hash, info: result };
   }
 }

@@ -239,10 +239,9 @@ async fn test_set_governance_source() {
         .args_json(&json!({
             "vaa": vaa,
         }))
-        .transact_async()
+        .transact()
         .await
         .expect("Failed to submit VAA")
-        .await
         .unwrap()
         .failures()
         .is_empty());
@@ -400,7 +399,7 @@ async fn test_stale_threshold() {
         &contract
             .view("get_update_fee_estimate")
             .args_json(&json!({
-                "vaa": vaa,
+                "data": vaa,
             }))
             .await
             .unwrap()
@@ -410,7 +409,7 @@ async fn test_stale_threshold() {
 
     // Submit price. As there are no prices this should succeed despite being old.
     assert!(contract
-        .call("update_price_feed")
+        .call("update_price_feeds")
         .gas(300_000_000_000_000)
         .deposit(update_fee.into())
         .args_json(&json!({
@@ -482,7 +481,7 @@ async fn test_stale_threshold() {
 
     // The update handler should now succeed even if price is old, but simply not update the price.
     assert!(contract
-        .call("update_price_feed")
+        .call("update_price_feeds")
         .gas(300_000_000_000_000)
         .deposit(update_fee.into())
         .args_json(&json!({
@@ -500,10 +499,10 @@ async fn test_stale_threshold() {
     // timestamp and price should be unchanged.
     assert_eq!(
         Price {
-            price:     100,
-            conf:      1,
-            expo:      8,
-            timestamp: now,
+            price:        100.into(),
+            conf:         1.into(),
+            expo:         8,
+            publish_time: now as i64,
         },
         serde_json::from_slice::<Price>(
             &contract
@@ -560,10 +559,10 @@ async fn test_stale_threshold() {
     // [ref:failed_price_check]
     assert_eq!(
         Some(Price {
-            price:     100,
-            conf:      1,
-            expo:      8,
-            timestamp: now,
+            price:        100.into(),
+            conf:         1.into(),
+            expo:         8,
+            publish_time: now as i64,
         }),
         serde_json::from_slice::<Option<Price>>(
             &contract
@@ -616,7 +615,7 @@ async fn test_contract_fees() {
         &contract
             .view("get_update_fee_estimate")
             .args_json(&json!({
-                "vaa": vaa,
+                "data": vaa,
             }))
             .await
             .unwrap()
@@ -648,7 +647,7 @@ async fn test_contract_fees() {
                 &contract
                     .view("get_update_fee_estimate")
                     .args_json(&json!({
-                        "vaa": vaa,
+                        "data": vaa,
                     }))
                     .await
                     .unwrap()
@@ -699,7 +698,7 @@ async fn test_contract_fees() {
     };
 
     assert!(contract
-        .call("update_price_feed")
+        .call("update_price_feeds")
         .gas(300_000_000_000_000)
         .deposit(update_fee.into())
         .args_json(&json!({
@@ -990,7 +989,6 @@ async fn test_accumulator_updates() {
     fn create_accumulator_message_from_updates(
         price_updates: Vec<MerklePriceUpdate>,
         tree: MerkleTree<Keccak160>,
-        corrupt_wormhole_message: bool,
         emitter_address: [u8; 32],
         emitter_chain: u16,
     ) -> Vec<u8> {
@@ -1026,11 +1024,7 @@ async fn test_accumulator_updates() {
         to_vec::<_, BigEndian>(&accumulator_update_data).unwrap()
     }
 
-    fn create_accumulator_message(
-        all_feeds: &[Message],
-        updates: &[Message],
-        corrupt_wormhole_message: bool,
-    ) -> Vec<u8> {
+    fn create_accumulator_message(all_feeds: &[Message], updates: &[Message]) -> Vec<u8> {
         let all_feeds_bytes: Vec<_> = all_feeds
             .iter()
             .map(|f| to_vec::<_, BigEndian>(f).unwrap())
@@ -1050,7 +1044,6 @@ async fn test_accumulator_updates() {
         create_accumulator_message_from_updates(
             price_updates,
             tree,
-            corrupt_wormhole_message,
             [1; 32],
             wormhole::Chain::Any.into(),
         )
@@ -1109,12 +1102,12 @@ async fn test_accumulator_updates() {
     // Create a couple of test feeds.
     let feed_1 = create_dummy_price_feed_message(100);
     let feed_2 = create_dummy_price_feed_message(200);
-    let message = create_accumulator_message(&[feed_1, feed_2], &[feed_1], false);
+    let message = create_accumulator_message(&[feed_1, feed_2], &[feed_1]);
     let message = hex::encode(message);
 
     // Call the usual UpdatePriceFeed function.
     assert!(contract
-        .call("update_price_feed")
+        .call("update_price_feeds")
         .gas(300_000_000_000_000)
         .deposit(300_000_000_000_000_000_000_000)
         .args_json(&json!({
@@ -1127,4 +1120,87 @@ async fn test_accumulator_updates() {
         .unwrap()
         .failures()
         .is_empty());
+
+    // Check the price feed actually updated. Check both types of serialized PriceIdentifier.
+    let mut identifier = [0; 32];
+    identifier[0] = 100;
+
+    assert_eq!(
+        Some(Price {
+            price:        100.into(),
+            conf:         100.into(),
+            expo:         100,
+            publish_time: 100,
+        }),
+        serde_json::from_slice::<Option<Price>>(
+            &contract
+                .view("get_price_unsafe")
+                .args_json(&json!({ "price_identifier": PriceIdentifier(identifier) }))
+                .await
+                .unwrap()
+                .result
+        )
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn test_sdk_compat() {
+    let price = pyth_sdk::Price {
+        price:        i64::MAX,
+        conf:         u64::MAX,
+        expo:         100,
+        publish_time: 100,
+    };
+
+    let encoded = serde_json::to_string(&price).unwrap();
+    let decoded_price: Price = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        decoded_price,
+        Price {
+            price:        i64::MAX.into(),
+            conf:         u64::MAX.into(),
+            expo:         100,
+            publish_time: 100,
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_borsh_field_cmopat() {
+    use near_sdk::borsh::{
+        self,
+        BorshDeserialize,
+        BorshSerialize,
+    };
+
+    let price = pyth_sdk::Price {
+        price:        i64::MAX,
+        conf:         u64::MAX,
+        expo:         100,
+        publish_time: 100,
+    };
+
+    // Verify that we can still BorshDeserialize a struct with a different field name. Confirms
+    // we don't have to migrate the state.
+    #[derive(Eq, PartialEq, Debug, BorshSerialize, BorshDeserialize)]
+    struct PriceTester {
+        price:          i64,
+        conf:           u64,
+        expo:           u32,
+        bad_field_name: u64,
+    }
+
+    let encoded = near_sdk::borsh::BorshSerialize::try_to_vec(&price).unwrap();
+    let decoded_price: PriceTester =
+        near_sdk::borsh::BorshDeserialize::try_from_slice(&encoded).unwrap();
+    assert_eq!(
+        decoded_price,
+        PriceTester {
+            price:          i64::MAX.into(),
+            conf:           u64::MAX.into(),
+            expo:           100,
+            bad_field_name: 100,
+        }
+    );
 }

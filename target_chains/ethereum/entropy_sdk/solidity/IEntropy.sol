@@ -10,16 +10,17 @@ interface IEntropy is EntropyEvents {
     //
     // chainLength is the number of values in the hash chain *including* the commitment, that is, chainLength >= 1.
     function register(
-        uint feeInWei,
+        uint128 feeInWei,
         bytes32 commitment,
-        bytes32 commitmentMetadata,
-        uint64 chainLength
+        bytes calldata commitmentMetadata,
+        uint64 chainLength,
+        bytes calldata uri
     ) external;
 
     // Withdraw a portion of the accumulated fees for the provider msg.sender.
     // Calling this function will transfer `amount` wei to the caller (provided that they have accrued a sufficient
     // balance of fees in the contract).
-    function withdraw(uint256 amount) external;
+    function withdraw(uint128 amount) external;
 
     // As a user, request a random number from `provider`. Prior to calling this method, the user should
     // generate a random number x and keep it secret. The user should then compute hash(x) and pass that
@@ -55,17 +56,19 @@ interface IEntropy is EntropyEvents {
         address provider
     ) external view returns (EntropyStructs.ProviderInfo memory info);
 
+    function getDefaultProvider() external view returns (address provider);
+
     function getRequest(
         address provider,
         uint64 sequenceNumber
     ) external view returns (EntropyStructs.Request memory req);
 
-    function getFee(address provider) external view returns (uint feeAmount);
+    function getFee(address provider) external view returns (uint128 feeAmount);
 
     function getAccruedPythFees()
         external
         view
-        returns (uint accruedPythFeesInWei);
+        returns (uint128 accruedPythFeesInWei);
 
     function constructUserCommitment(
         bytes32 userRandomness

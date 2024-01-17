@@ -1,11 +1,12 @@
 use {
     crate::{
         api,
+        chain::ethereum::PythContract,
+        command::register_provider::CommitmentMetadata,
         config::{
             Config,
             RunOptions,
         },
-        ethereum::PythContract,
         state::{
             HashChainState,
             PebbleHashChain,
@@ -15,10 +16,7 @@ use {
         anyhow,
         Result,
     },
-    axum::{
-        routing::get,
-        Router,
-    },
+    axum::Router,
     std::{
         collections::HashMap,
         sync::Arc,
@@ -43,12 +41,14 @@ pub async fn run(opts: &RunOptions) -> Result<()> {
     )
     ),
     tags(
-    (name = "pyth-rng", description = "Pyth Random Number Service")
+    (name = "fortuna", description = "Random number service for the Pyth Entropy protocol")
     )
     )]
     struct ApiDoc;
 
     let config = Config::load(&opts.config.config)?;
+    let secret = opts.randomness.load_secret()?;
+
 
     let mut chains = HashMap::new();
     for (chain_id, chain_config) in &config.chains {
@@ -62,8 +62,17 @@ pub async fn run(opts: &RunOptions) -> Result<()> {
         // TODO: we may want to load the hash chain in a lazy/fault-tolerant way. If there are many blockchains,
         // then it's more likely that some RPC fails. We should tolerate these faults and generate the hash chain
         // later when a user request comes in for that chain.
-        let random: [u8; 32] = provider_info.commitment_metadata;
-        let hash_chain = PebbleHashChain::from_config(&opts.randomness, &chain_id, random)?;
+        let metadata =
+            bincode::deserialize::<CommitmentMetadata>(&provider_info.commitment_metadata)?;
+
+        let hash_chain = PebbleHashChain::from_config(
+            &secret,
+            &chain_id,
+            &opts.provider,
+            &chain_config.contract_addr,
+            &metadata.seed,
+            metadata.chain_length,
+        )?;
         let chain_state = HashChainState {
             offsets:     vec![provider_info
                 .original_commitment_sequence_number
@@ -83,6 +92,7 @@ pub async fn run(opts: &RunOptions) -> Result<()> {
             state: Arc::new(chain_state),
             contract,
             provider_address: opts.provider,
+            reveal_delay_blocks: chain_config.reveal_delay_blocks,
         };
 
         chains.insert(chain_id.clone(), state);
@@ -99,16 +109,7 @@ pub async fn run(opts: &RunOptions) -> Result<()> {
     let app = Router::new();
     let app = app
         .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()))
-        .route("/", get(api::index))
-        .route("/live", get(api::live))
-        .route("/metrics", get(api::metrics))
-        .route("/ready", get(api::ready))
-        .route("/v1/chains", get(api::chain_ids))
-        .route(
-            "/v1/chains/:chain_id/revelations/:sequence",
-            get(api::revelation),
-        )
-        .with_state(api_state)
+        .merge(api::routes(api_state))
         // Permissive CORS layer to allow all origins
         .layer(CorsLayer::permissive());
 

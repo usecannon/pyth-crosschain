@@ -15,6 +15,7 @@ use {
     },
     pythnet_sdk::wire::array,
     serde_with::serde_as,
+    tokio::try_join,
     utoipa::{
         IntoParams,
         ToSchema,
@@ -59,26 +60,32 @@ pub async fn revelation(
         .get(&chain_id)
         .ok_or_else(|| RestError::InvalidChainId)?;
 
-    let r = state
-        .contract
-        .get_request(state.provider_address, sequence)
-        .call()
-        .await
-        .map_err(|_| RestError::TemporarilyUnavailable)?;
+    let maybe_request_fut = state.contract.get_request(state.provider_address, sequence);
 
-    // sequence_number == 0 means the request does not exist.
-    if r.sequence_number != 0 {
-        let value = &state
-            .state
-            .reveal(sequence)
-            .map_err(|_| RestError::Unknown)?;
-        let encoded_value = Blob::new(encoding.unwrap_or(BinaryEncoding::Hex), value.clone());
+    let current_block_number_fut = state.contract.get_block_number();
 
-        Ok(Json(GetRandomValueResponse {
-            value: encoded_value,
-        }))
-    } else {
-        Err(RestError::NoPendingRequest)
+    let (maybe_request, current_block_number) =
+        try_join!(maybe_request_fut, current_block_number_fut).map_err(|e| {
+            tracing::error!("RPC request failed {}", e);
+            RestError::TemporarilyUnavailable
+        })?;
+
+    match maybe_request {
+        Some(r)
+            if current_block_number.saturating_sub(state.reveal_delay_blocks) >= r.block_number =>
+        {
+            let value = &state
+                .state
+                .reveal(sequence)
+                .map_err(|_| RestError::Unknown)?;
+            let encoded_value = Blob::new(encoding.unwrap_or(BinaryEncoding::Hex), value.clone());
+
+            Ok(Json(GetRandomValueResponse {
+                value: encoded_value,
+            }))
+        }
+        Some(_) => Err(RestError::PendingConfirmation),
+        None => Err(RestError::NoPendingRequest),
     }
 }
 
@@ -107,14 +114,13 @@ pub enum BinaryEncoding {
     Array,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema, PartialEq)]
 pub struct GetRandomValueResponse {
-    // TODO: choose serialization format
     pub value: Blob,
 }
 
 #[serde_as]
-#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema, PartialEq)]
 #[serde(tag = "encoding", rename_all = "kebab-case")]
 pub enum Blob {
     Hex {

@@ -1,12 +1,10 @@
 use {
-    crate::{
-        api::ChainId,
-        config::RandomnessOptions,
-    },
+    crate::api::ChainId,
     anyhow::{
         ensure,
         Result,
     },
+    ethers::types::Address,
     sha3::{
         Digest,
         Keccak256,
@@ -14,6 +12,7 @@ use {
 };
 
 /// A HashChain.
+#[derive(Clone)]
 pub struct PebbleHashChain {
     hash: Vec<[u8; 32]>,
     next: usize,
@@ -35,17 +34,22 @@ impl PebbleHashChain {
     }
 
     pub fn from_config(
-        opts: &RandomnessOptions,
+        secret: &str,
         chain_id: &ChainId,
-        random: [u8; 32],
+        provider_address: &Address,
+        contract_address: &Address,
+        random: &[u8; 32],
+        chain_length: u64,
     ) -> Result<Self> {
         let mut input: Vec<u8> = vec![];
-        input.extend_from_slice(&hex::decode(opts.secret.clone())?);
+        input.extend_from_slice(&hex::decode(secret)?);
         input.extend_from_slice(&chain_id.as_bytes());
-        input.extend_from_slice(&random);
+        input.extend_from_slice(&provider_address.as_bytes());
+        input.extend_from_slice(&contract_address.as_bytes());
+        input.extend_from_slice(random);
 
         let secret: [u8; 32] = Keccak256::digest(input).into();
-        Ok(Self::new(secret, opts.chain_length.try_into()?))
+        Ok(Self::new(secret, chain_length.try_into()?))
     }
 
     /// Reveal the next hash in the chain using the previous proof.
@@ -76,6 +80,13 @@ pub struct HashChainState {
 }
 
 impl HashChainState {
+    pub fn from_chain_at_offset(offset: usize, chain: PebbleHashChain) -> HashChainState {
+        HashChainState {
+            offsets:     vec![offset],
+            hash_chains: vec![chain],
+        }
+    }
+
     pub fn reveal(&self, sequence_number: u64) -> Result<[u8; 32]> {
         let sequence_number: usize = sequence_number.try_into()?;
         let chain_index = self

@@ -37,6 +37,7 @@ The parameters above are configured per price feed in a price configuration YAML
   time_difference: 60 # Time difference threshold (in seconds) to push a newer price feed.
   price_deviation: 0.5 # The price deviation (%) threshold to push a newer price feed.
   confidence_ratio: 1 # The confidence/price (%) threshold to push a newer price feed.
+
   # Optional block to configure whether this feed can be early updated. If at least one feed meets the
   # triggering conditions above, all other feeds who meet the early update conditions will be included in
   # the submitted batch of prices. This logic takes advantage of the fact that adding a feed to a larger
@@ -49,10 +50,34 @@ The parameters above are configured per price feed in a price configuration YAML
 - ...
 ```
 
+By default, the price pusher will automatically update the price of all listed price feeds whenever the
+triggering condition for a single feed is met. This behavior takes advantage of the reduced cost of batch price updates
+provided by the [Perseus upgrade](https://medium.com/@antonia.vanna.delgado/pyth-network-perseus-first-party-data-matters-e3379bf0d019),
+and is typically the lowest cost way to schedule price updates for multiple feeds.
+
+However, if you would like to customize this behavior, you can add an `early_update` section to the YAML configuration file for
+the feed.
+
+```yaml
+- alias: A/USD # Arbitrary alias for the price feed. It is used in enhance logging.
+  ...
+  # If provided, only early update this price feed if at least one of the listed triggering conditions is met.
+  early_update:
+    time_difference: 30
+    price_deviation: 0.1
+    confidence_ratio: 0.5
+```
+
 Two sample YAML configuration files are available in the root of this repo.
 
 You can get the list of available price feeds from
 [here](https://pyth.network/developers/price-feed-ids/).
+
+Price pusher communicates with [Hermes][] price service to get the most recent price updates. Hermes listens to the
+Pythnet and Wormhole network to get latest price updates, and serves REST and websocket APIs for consumers to fetch the
+updates. Pyth hosts public endpoints for Hermes; however, it is recommended to get a private endpoint from one of the
+Hermes RPC providers for more reliability. Please refer to [this
+document](https://docs.pyth.network/documentation/pythnet-price-feeds/hermes) for more information.
 
 To run the price pusher, please run the following commands, replacing the command line arguments as necessary:
 
@@ -67,8 +92,8 @@ cd price_pusher
 # For EVM
 npm run start -- evm --endpoint wss://example-rpc.com \
     --pyth-contract-address 0xff1a0f4744e8582DF...... \
-    --price-service-endpoint https://example-pyth-price.com \
-    --price-config-file "path/to/price-config.testnet.sample.yaml" \
+    --price-service-endpoint https://example-hermes-rpc.com \
+    --price-config-file "path/to/price-config.beta.sample.yaml" \
     --mnemonic-file "path/to/mnemonic.txt" \
     [--pushing-frequency 10] \
     [--polling-frequency 5] \
@@ -76,17 +101,19 @@ npm run start -- evm --endpoint wss://example-rpc.com \
 
 # For Injective
 npm run start -- injective --grpc-endpoint https://grpc-endpoint.com \
-    --pyth-contract-address inj1z60tg0... --price-service-endpoint "https://example-pyth-price.com" \
-    --price-config-file "path/to/price-config.testnet.sample.yaml" \
+    --pyth-contract-address inj1z60tg0... --price-service-endpoint "https://example-hermes-rpc.com" \
+    --price-config-file "path/to/price-config.beta.sample.yaml" \
     --mnemonic-file "path/to/mnemonic.txt" \
     --network testnet \
+    [--gas-price 500000000] \
     [--pushing-frequency 10] \
     [--polling-frequency 5]
 
 # For Aptos
 npm run start -- aptos --endpoint https://fullnode.testnet.aptoslabs.com/v1 \
-    --pyth-contract-address 0x7e783b349d3e89cf5931af376ebeadbfab855b3fa239b7ada8f5a92fbea6b387 --price-service-endpoint "https://hermes-beta.pyth.network" \
-    --price-config-file "./price-config.testnet.sample.yaml" \
+    --pyth-contract-address 0x7e783b349d3e89cf5931af376ebeadbfab855b3fa239b7ada8f5a92fbea6b387 \
+    --price-service-endpoint "https://example-hermes-rpc.com" \
+    --price-config-file "path/to/price-config.beta.sample.yaml" \
     --mnemonic-file "path/to/mnemonic.txt" \
     [--pushing-frequency 10] \
     [--polling-frequency 5]
@@ -99,9 +126,9 @@ npm run start -- sui \
   --wormhole-package-id 0xcc029e2810f17f9f43f52262f40026a71fbdca40ed3803ad2884994361910b7e \
   --wormhole-state-id 0xebba4cc4d614f7a7cdbe883acc76d1cc767922bc96778e7b68be0d15fce27c02 \
   --price-feed-to-price-info-object-table-id 0xf8929174008c662266a1adde78e1e8e33016eb7ad37d379481e860b911e40ed5 \
-  --price-service-endpoint https://hermes-beta.pyth.network \
+  --price-service-endpoint https://example-hermes-rpc.com \
   --mnemonic-file ./mnemonic \
-  --price-config-file ./price-config.testnet.sample.yaml \
+  --price-config-file ./price-config.beta.sample.yaml \
   [--pushing-frequency 10] \
   [--polling-frequency 5] \
   [--num-gas-objects 30]
@@ -110,6 +137,8 @@ npm run start -- sui \
 # Or, run the price pusher docker image instead of building from the source
 docker run public.ecr.aws/pyth-network/xc-price-pusher:v<version> -- <above-arguments>
 ```
+
+[hermes]: https://github.com/pyth-network/pyth-crosschain/tree/main/hermes
 
 ### Command Line Arguments
 
@@ -127,14 +156,17 @@ npm run start -- {network} --help
 For example, to push `BTC/USD` and `BNB/USD` prices on Fantom testnet, run the following command:
 
 ```sh
-npm run dev -- evm --endpoint https://endpoints.omniatech.io/v1/fantom/testnet/public \
-    --pyth-contract-address 0xff1a0f4744e8582DF1aE09D5611b887B6a12925C --price-service-endpoint https://hermes-beta.pyth.network \
-    --mnemonic-file "./mnemonic" --price-config-file "./price-config.testnet.sample.yaml"
+npm run dev -- evm \
+  --endpoint https://endpoints.omniatech.io/v1/fantom/testnet/public \
+  --pyth-contract-address 0x5744Cbf430D99456a0A8771208b674F27f8EF0Fb \
+  --price-service-endpoint https://hermes.pyth.network \
+  --mnemonic-file "./mnemonic" \
+  --price-config-file "./price-config.stable.sample.yaml"
 ```
 
-[`price-config.testnet.sample.yaml`](./price-config.testnet.sample.yaml) contains configuration for `BTC/USD`
-and `BNB/USD` price feeds on Pyth testnet. [`price-config.mainnet.sample.yaml`](./price-config.mainnet.sample.yaml)
-contains the same configuration for `BTC/USD` and `BNB/USD` on Pyth mainnet.
+[`price-config.stable.sample.yaml`](./price-config.stable.sample.yaml) contains configuration for `BTC/USD`
+and `BNB/USD` price feeds on Pyth stable data sources. [`price-config.beta.sample.yaml`](./price-config.beta.sample.yaml)
+contains the same configuration for `BTC/USD` and `BNB/USD` on Pyth beta data sources.
 
 You can also provide a config file instead of providing command line options, run the following command:
 
@@ -144,29 +176,21 @@ npm run start -- injective --config "./config.injective.sample.json"
 
 [`config.injective.sample.json`](./config.injective.sample.json) contains configuration to publish on Injective testnet.
 
-## Running using a standalone price service (via docker-compose)
+## Running via docker-compose
 
-Price pusher communicates with [Pyth price service][] to get the most recent price updates. Pyth price service listens to the
-Wormhole network to get latest price updates, and serves REST and websocket APIs for consumers to fetch the updates.
-Pyth hosts public endpoints for the price service; however, it is recommended to run it standalone to achieve more resiliency and
-scalability.
+This directory contains sample docker compose files ([stable](./docker-compose.stable.sample.yaml),
+[beta](./docker-compose.beta.sample.yaml)) a price pusher.
 
-This directory contains sample docker compose files ([testnet](./docker-compose.testnet.sample.yaml),
-[mainnet](./docker-compose.mainnet.sample.yaml)) a price pusher and its dependencies, including a
-price service and a Wormhole spy. A price service depends on a Wormhole spy. A spy listens to the Wormhole
-network and reports all Pyth-related Wormhole messages to the price service.
-
-To run the services via docker-compose, please modify the your target network (testnet, mainnet) sample docker-compose file to adjust the configurations.
+To run the services via docker-compose, please set the RPC endpoint and contract address of your target network in the
+sample docker-compose file.
 
 Then, start the docker-compose like this:
 
 ```
-docker-compose -f docker-compose.testnet.sample.yaml up
+docker-compose -f docker-compose.stable.sample.yaml up
 ```
 
 It will take a few minutes until all the services are up and running.
-
-[pyth price service]: https://github.com/pyth-network/pyth-crosschain/tree/main/price_service/server
 
 ## Reliability
 

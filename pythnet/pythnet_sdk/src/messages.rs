@@ -1,8 +1,15 @@
 #[cfg(feature = "quickcheck")]
 use quickcheck::Arbitrary;
-use serde::{
-    Deserialize,
-    Serialize,
+use {
+    borsh::{
+        BorshDeserialize,
+        BorshSchema,
+        BorshSerialize,
+    },
+    serde::{
+        Deserialize,
+        Serialize,
+    },
 };
 
 /// Message format for sending data to other chains via the accumulator program
@@ -68,7 +75,17 @@ impl Arbitrary for Message {
 pub type FeedId = [u8; 32];
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Copy,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    BorshDeserialize,
+    BorshSerialize,
+    BorshSchema,
+)]
 pub struct PriceFeedMessage {
     pub feed_id:           FeedId,
     pub price:             i64,

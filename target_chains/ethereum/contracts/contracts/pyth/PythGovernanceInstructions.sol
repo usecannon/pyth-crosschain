@@ -19,7 +19,10 @@ contract PythGovernanceInstructions {
 
     enum GovernanceModule {
         Executor, // 0
-        Target // 1
+        Target, // 1
+        EvmExecutor, // 2
+        // The stacks target chain contract has custom governance instructions and needs its own module.
+        StacksTarget // 3
     }
 
     GovernanceModule constant MODULE = GovernanceModule.Target;

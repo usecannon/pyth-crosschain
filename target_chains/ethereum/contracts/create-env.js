@@ -1,7 +1,7 @@
 /**
  * This script is used to generate the .env file for a specific network.
  * You can call it like this:
- *  node create-env.js <contract-id>
+ *  node create-env.js <chain-id>
  */
 
 const { DefaultStore, EvmChain } = require("contract_manager");
@@ -20,10 +20,8 @@ async function main() {
     `.env`,
     `MIGRATIONS_DIR=./migrations/prod-receiver\n` +
       `MIGRATIONS_NETWORK=${chain.getId()}\n` +
-      `WORMHOLE_CHAIN_NAME=${chain.wormholeChainName}\n` +
       `VALID_TIME_PERIOD_SECONDS=60\n` +
       `SINGLE_UPDATE_FEE_IN_WEI=1\n` +
-      `CLUSTER=${chain.isMainnet() ? "mainnet" : "testnet"}\n` +
       `NETWORK_ID=${chain.networkId}\n` +
       `RPC_URL=${chain.getRpcUrl()}\n`
   );

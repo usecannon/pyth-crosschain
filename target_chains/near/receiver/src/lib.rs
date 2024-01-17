@@ -72,6 +72,9 @@ enum StorageKeys {
     Prices,
 }
 
+/// Alias to document time unit Pyth expects data to be in.
+type Seconds = u64;
+
 /// The `State` contains all persisted state for the contract. This includes runtime configuration.
 ///
 /// There is no valid Default state for this contract, so we derive PanicOnDefault to force
@@ -120,7 +123,6 @@ impl Pyth {
     #[allow(clippy::new_without_default)]
     pub fn new(
         wormhole: AccountId,
-        codehash: [u8; 32],
         initial_source: Source,
         gov_source: Source,
         update_fee: U128,
@@ -137,21 +139,55 @@ impl Pyth {
             gov_source,
             sources,
             wormhole,
-            codehash,
+            codehash: Default::default(),
             update_fee: update_fee.into(),
         }
     }
 
+    #[private]
     #[init(ignore_state)]
     pub fn migrate() -> Self {
-        let state: Self = env::state_read().expect("Failed to read state");
+        // This currently deserializes and produces the same state, I.E migration is a no-op to the
+        // current state.
+        //
+        // In the case where we want to actually migrate to a new state, we can do this by defining
+        // the old State struct here and then deserializing into that, then migrating into the new
+        // state, example code for the future reader:
+        //
+        // ```rust
+        // pub fn migrate() -> Self {
+        //     pub struct OldPyth {
+        //         sources:                        UnorderedSet<Source>,
+        //         gov_source:                     Source,
+        //         executed_governance_vaa:        u64,
+        //         executed_governance_change_vaa: u64,
+        //         prices:                         UnorderedMap<PriceIdentifier, PriceFeed>,
+        //         wormhole:                       AccountId,
+        //         codehash:                       [u8; 32],
+        //         stale_threshold:                Duration,
+        //         update_fee:                     u128,
+        //     }
+        //
+        //     // Construct new Pyth State from old, perform any migrations needed.
+        //     let old: OldPyth = env::state_read().expect("Failed to read state");
+        //
+        //     Self {
+        //        sources:    old.sources,
+        //        gov_source: old.gov_source,
+        //        ...
+        //     }
+        // }
+        // ```
+        let mut state: Self = env::state_read().expect("Failed to read state");
+        state.codehash = Default::default();
         state
     }
 
     /// Instruction for processing VAA's relayed via Wormhole.
     ///
     /// Note that VAA verification requires calling Wormhole so processing of the VAA itself is
-    /// done in a callback handler, see `process_vaa_callback`.
+    /// done in a callback handler, see `process_vaa_callback`. The `data` parameter can be
+    /// retrieved from Hermes using the price feed APIs.
     #[payable]
     #[handle_result]
     pub fn update_price_feeds(&mut self, data: String) -> Result<(), Error> {
@@ -231,14 +267,7 @@ impl Pyth {
         // forces the caller to add the required fee to the deposit. The protocol defines the fee
         // as a u128, but storage is a u64, so we need to check that the fee does not overflow the
         // storage cost as well.
-        let storage = (env::storage_usage() as u128)
-            .checked_sub(
-                self.update_fee
-                    .checked_div(env::storage_byte_cost())
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .ok_or(Error::InsufficientDeposit)
-            .and_then(|s| u64::try_from(s).map_err(|_| Error::ArithmeticOverflow))?;
+        let storage = env::storage_usage();
 
         // Deserialize VAA, note that we already deserialized and verified the VAA in `process_vaa`
         // at this point so we only care about the `rest` component which contains bytes we can
@@ -285,11 +314,12 @@ impl Pyth {
         );
 
         // Refund storage difference to `account_id` after storage execution.
-        self.refund_storage_usage(
+        Self::refund_storage_usage(
             account_id,
             storage,
             env::storage_usage(),
             env::attached_deposit(),
+            Some(self.update_fee),
         )
     }
 
@@ -375,11 +405,12 @@ impl Pyth {
         );
 
         // Refund storage difference to `account_id` after storage execution.
-        self.refund_storage_usage(
+        Self::refund_storage_usage(
             account_id,
             storage,
             env::storage_usage(),
             env::attached_deposit(),
+            Some(self.update_fee),
         )
     }
 
@@ -460,15 +491,19 @@ impl Pyth {
 
     /// Get the latest available price cached for the given price identifier, if that price is
     /// no older than the given age.
-    pub fn get_price_no_older_than(&self, price_id: PriceIdentifier, age: u64) -> Option<Price> {
+    pub fn get_price_no_older_than(
+        &self,
+        price_id: PriceIdentifier,
+        age: Seconds,
+    ) -> Option<Price> {
         self.prices.get(&price_id).and_then(|feed| {
             let block_timestamp = env::block_timestamp() / 1_000_000_000;
-            let price_timestamp = feed.price.timestamp;
+            let price_timestamp = feed.price.publish_time;
 
             // - If Price older than STALENESS_THRESHOLD, set status to Unknown.
             // - If Price newer than now by more than STALENESS_THRESHOLD, set status to Unknown.
             // - Any other price around the current time is considered valid.
-            if u64::abs_diff(block_timestamp, price_timestamp) > age {
+            if u64::abs_diff(block_timestamp, price_timestamp.try_into().unwrap()) > age {
                 return None;
             }
 
@@ -490,16 +525,16 @@ impl Pyth {
     pub fn get_ema_price_no_older_than(
         &self,
         price_id: PriceIdentifier,
-        age: u64,
+        age: Seconds,
     ) -> Option<Price> {
         self.prices.get(&price_id).and_then(|feed| {
-            let block_timestamp = env::block_timestamp();
-            let price_timestamp = feed.ema_price.timestamp;
+            let block_timestamp = env::block_timestamp() / 1_000_000_000;
+            let price_timestamp = feed.ema_price.publish_time;
 
             // - If Price older than STALENESS_THRESHOLD, set status to Unknown.
             // - If Price newer than now by more than STALENESS_THRESHOLD, set status to Unknown.
             // - Any other price around the current time is considered valid.
-            if u64::abs_diff(block_timestamp, price_timestamp) > age {
+            if u64::abs_diff(block_timestamp, price_timestamp.try_into().unwrap()) > age {
                 return None;
             }
 
@@ -537,7 +572,7 @@ impl Pyth {
     fn update_price_feed_if_new(&mut self, price_feed: PriceFeed) -> bool {
         match self.prices.get(&price_feed.id) {
             Some(stored_price_feed) => {
-                let update = price_feed.price.timestamp > stored_price_feed.price.timestamp;
+                let update = price_feed.price.publish_time > stored_price_feed.price.publish_time;
                 update.then(|| self.prices.insert(&price_feed.id, &price_feed));
                 update
             }
@@ -549,18 +584,22 @@ impl Pyth {
         }
     }
 
-    /// Checks storage usage invariants and additionally refunds the caller if they overpay.
+    /// Checks storage usage invariants and additionally refunds the caller if they overpay. This
+    /// method can optionally charge a fee to the caller which is removed from their deposit during
+    /// refund.
     fn refund_storage_usage(
-        &self,
-        refunder: AccountId,
+        recipient: AccountId,
         before: StorageUsage,
         after: StorageUsage,
         deposit: Balance,
+        additional_fee: Option<Balance>,
     ) -> Result<(), Error> {
+        let fee = additional_fee.unwrap_or(0);
+
         if let Some(diff) = after.checked_sub(before) {
             // Handle storage increases if checked_sub succeeds.
             let cost = Balance::from(diff);
-            let cost = cost * env::storage_byte_cost();
+            let cost = (cost * env::storage_byte_cost()) + fee;
 
             // If the cost is higher than the deposit we bail.
             if cost > deposit {
@@ -569,13 +608,15 @@ impl Pyth {
 
             // Otherwise we refund whatever is left over.
             if deposit - cost > 0 {
-                Promise::new(refunder).transfer(cost);
+                Promise::new(recipient).transfer(deposit - cost);
             }
         } else {
-            // Handle storage decrease if checked_sub fails. We know storage used now is <=
+            // If checked_sub fails we have a storage decrease, we want to refund them the cost of
+            // the amount reduced, as well the original deposit they sent.
             let refund = Balance::from(before - after);
             let refund = refund * env::storage_byte_cost();
-            Promise::new(refunder).transfer(refund);
+            let refund = refund + deposit - fee;
+            Promise::new(recipient).transfer(refund);
         }
 
         Ok(())

@@ -6,6 +6,7 @@ import "@pythnetwork/entropy-sdk-solidity/EntropyStructs.sol";
 import "@pythnetwork/entropy-sdk-solidity/EntropyErrors.sol";
 import "@pythnetwork/entropy-sdk-solidity/EntropyEvents.sol";
 import "@pythnetwork/entropy-sdk-solidity/IEntropy.sol";
+import "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import "./EntropyState.sol";
 
 // Entropy implements a secure 2-party random number generation procedure. The protocol
@@ -37,14 +38,15 @@ import "./EntropyState.sol";
 //    of the provider's random numbers the user will receive.
 // 3. The user submits an off-chain request (e.g. via HTTP) to the provider to reveal the i'th random number.
 // 4. The provider checks the on-chain sequence number and ensures it is > i. If it is not, the provider
-//    refuses to reveal the ith random number.
+//    refuses to reveal the ith random number. The provider should wait for a sufficient number of block confirmations
+//    to ensure that the request does not get re-orged out of the blockchain.
 // 5. The provider reveals x_i to the user.
 // 6. The user submits both the provider's revealed number x_i and their own x_U to the contract.
 // 7. The contract verifies hash(x_i) == x_{i-1} to prove that x_i is the i'th random number. The contract also checks that hash(x_U) == h_U.
 //    The contract stores x_i as the i'th random number to reuse for future verifications.
 // 8. If both of the above conditions are satisfied, the random number r = hash(x_i, x_U).
-//    (Optional) as an added security mechanism, this step can further incorporate the blockhash of the request transaction,
-//    r = hash(x_i, x_U, blockhash).
+//    (Optional) as an added security mechanism, this step can further incorporate the blockhash of the block that the
+//    request transaction landed in: r = hash(x_i, x_U, blockhash).
 //
 // This protocol has the same security properties as the 2-party randomness protocol above: as long as either
 // the provider or user is honest, the number r is random. Honesty here means that the participant keeps their
@@ -62,29 +64,45 @@ import "./EntropyState.sol";
 // random number. Verification therefore may require computing multiple hashes (~ the number of concurrent requests).
 // Second, the implementation allows providers to rotate their commitment at any time. This operation allows
 // providers to commit to additional random numbers once they reach the end of their initial sequence, or rotate out
-// a compromised sequence. On rotation, any in-flight requests are continue to use the pre-rotation commitment.
-// Each commitment has a metadata field that providers can use to determine which commitment a request is for.
-// Providers *must* retrieve the metadata for a request from the blockchain itself to prevent user manipulation of this field.
+// a compromised sequence. On rotation, any in-flight requests continue to use the pre-rotation commitment.
+// Providers can use the sequence number of the request along with the event log of their registrations to determine
+// which hash chain contains the requested random number.
 //
 // Warning to integrators:
-// An important caveat for users of this protocol is that the user can compute the random number r before
+// An important caveat of this protocol is that the user can compute the random number r before
 // revealing their own number to the contract. This property means that the user can choose to halt the
 // protocol prior to the random number being revealed (i.e., prior to step (6) above). Integrators should ensure that
 // the user is always incentivized to reveal their random number, and that the protocol has an escape hatch for
 // cases where the user chooses not to reveal.
-//
-// TODOs:
-// - governance??
-// - correct method access modifiers (public vs external)
-// - gas optimizations
-// - function to check invariants??
-// - need to increment pyth fees if someone transfers funds to the contract via another method
-// - off-chain data ERC support?
-contract Entropy is IEntropy, EntropyState {
-    // TODO: Use an upgradeable proxy
-    constructor(uint pythFeeInWei) {
+abstract contract Entropy is IEntropy, EntropyState {
+    function _initialize(
+        address admin,
+        uint128 pythFeeInWei,
+        address defaultProvider,
+        bool prefillRequestStorage
+    ) internal {
+        require(admin != address(0), "admin is zero address");
+        require(
+            defaultProvider != address(0),
+            "defaultProvider is zero address"
+        );
+
+        _state.admin = admin;
         _state.accruedPythFeesInWei = 0;
         _state.pythFeeInWei = pythFeeInWei;
+        _state.defaultProvider = defaultProvider;
+
+        if (prefillRequestStorage) {
+            // Write some data to every storage slot in the requests array such that new requests
+            // use a more consistent amount of gas.
+            // Note that these requests are not live because their sequenceNumber is 0.
+            for (uint8 i = 0; i < NUM_REQUESTS; i++) {
+                EntropyStructs.Request storage req = _state.requests[i];
+                req.provider = address(1);
+                req.blockNumber = 1234;
+                req.commitment = hex"0123";
+            }
+        }
     }
 
     // Register msg.sender as a randomness provider. The arguments are the provider's configuration parameters
@@ -93,10 +111,11 @@ contract Entropy is IEntropy, EntropyState {
     //
     // chainLength is the number of values in the hash chain *including* the commitment, that is, chainLength >= 1.
     function register(
-        uint feeInWei,
+        uint128 feeInWei,
         bytes32 commitment,
-        bytes32 commitmentMetadata,
-        uint64 chainLength
+        bytes calldata commitmentMetadata,
+        uint64 chainLength,
+        bytes calldata uri
     ) public override {
         if (chainLength == 0) revert EntropyErrors.AssertionFailure();
 
@@ -117,6 +136,7 @@ contract Entropy is IEntropy, EntropyState {
         provider.currentCommitmentSequenceNumber = provider.sequenceNumber;
         provider.commitmentMetadata = commitmentMetadata;
         provider.endSequenceNumber = provider.sequenceNumber + chainLength;
+        provider.uri = uri;
 
         provider.sequenceNumber += 1;
 
@@ -126,7 +146,7 @@ contract Entropy is IEntropy, EntropyState {
     // Withdraw a portion of the accumulated fees for the provider msg.sender.
     // Calling this function will transfer `amount` wei to the caller (provided that they have accrued a sufficient
     // balance of fees in the contract).
-    function withdraw(uint256 amount) public override {
+    function withdraw(uint128 amount) public override {
         EntropyStructs.ProviderInfo storage providerInfo = _state.providers[
             msg.sender
         ];
@@ -171,26 +191,32 @@ contract Entropy is IEntropy, EntropyState {
         providerInfo.sequenceNumber += 1;
 
         // Check that fees were paid and increment the pyth / provider balances.
-        uint requiredFee = getFee(provider);
+        uint128 requiredFee = getFee(provider);
         if (msg.value < requiredFee) revert EntropyErrors.InsufficientFee();
         providerInfo.accruedFeesInWei += providerInfo.feeInWei;
-        _state.accruedPythFeesInWei += (msg.value - providerInfo.feeInWei);
+        _state.accruedPythFeesInWei += (SafeCast.toUint128(msg.value) -
+            providerInfo.feeInWei);
 
         // Store the user's commitment so that we can fulfill the request later.
-        EntropyStructs.Request storage req = _state.requests[
-            requestKey(provider, assignedSequenceNumber)
-        ];
+        // Warning: this code needs to overwrite *every* field in the request, because the returned request can be
+        // filled with arbitrary data.
+        EntropyStructs.Request storage req = allocRequest(
+            provider,
+            assignedSequenceNumber
+        );
         req.provider = provider;
         req.sequenceNumber = assignedSequenceNumber;
-        req.userCommitment = userCommitment;
-        req.providerCommitment = providerInfo.currentCommitment;
-        req.providerCommitmentSequenceNumber = providerInfo
-            .currentCommitmentSequenceNumber;
-        req.providerCommitmentMetadata = providerInfo.commitmentMetadata;
+        req.numHashes = SafeCast.toUint32(
+            assignedSequenceNumber -
+                providerInfo.currentCommitmentSequenceNumber
+        );
+        req.commitment = keccak256(
+            bytes.concat(userCommitment, providerInfo.currentCommitment)
+        );
+        req.requester = msg.sender;
 
-        if (useBlockHash) {
-            req.blockNumber = block.number;
-        }
+        req.blockNumber = SafeCast.toUint64(block.number);
+        req.useBlockhash = useBlockHash;
 
         emit Requested(req);
     }
@@ -202,34 +228,52 @@ contract Entropy is IEntropy, EntropyState {
     // Note that this function can only be called once per in-flight request. Calling this function deletes the stored
     // request information (so that the contract doesn't use a linear amount of storage in the number of requests).
     // If you need to use the returned random number more than once, you are responsible for storing it.
+    //
+    // This function must be called by the same `msg.sender` that originally requested the random number. This check
+    // prevents denial-of-service attacks where another actor front-runs the requester's reveal transaction.
     function reveal(
         address provider,
         uint64 sequenceNumber,
         bytes32 userRandomness,
         bytes32 providerRevelation
     ) public override returns (bytes32 randomNumber) {
-        // TODO: do we need to check that this request exists?
-        // TODO: this method may need to be authenticated to prevent griefing
-        bytes32 key = requestKey(provider, sequenceNumber);
-        EntropyStructs.Request storage req = _state.requests[key];
-        // This invariant should be guaranteed to hold by the key construction procedure above, but check it
-        // explicitly to be extra cautious.
-        if (req.sequenceNumber != sequenceNumber)
-            revert EntropyErrors.AssertionFailure();
+        EntropyStructs.Request storage req = findRequest(
+            provider,
+            sequenceNumber
+        );
+        // Check that there is an active request for the given provider / sequence number.
+        if (
+            req.sequenceNumber == 0 ||
+            req.provider != provider ||
+            req.sequenceNumber != sequenceNumber
+        ) revert EntropyErrors.NoSuchRequest();
 
-        bool valid = isProofValid(
-            req.providerCommitmentSequenceNumber,
-            req.providerCommitment,
-            sequenceNumber,
+        if (req.requester != msg.sender) revert EntropyErrors.Unauthorized();
+
+        bytes32 providerCommitment = constructProviderCommitment(
+            req.numHashes,
             providerRevelation
         );
-        if (!valid) revert EntropyErrors.IncorrectProviderRevelation();
-        if (constructUserCommitment(userRandomness) != req.userCommitment)
-            revert EntropyErrors.IncorrectUserRevelation();
+        bytes32 userCommitment = constructUserCommitment(userRandomness);
+        if (
+            keccak256(bytes.concat(userCommitment, providerCommitment)) !=
+            req.commitment
+        ) revert EntropyErrors.IncorrectRevelation();
 
         bytes32 blockHash = bytes32(uint256(0));
-        if (req.blockNumber != 0) {
-            blockHash = blockhash(req.blockNumber);
+        if (req.useBlockhash) {
+            bytes32 _blockHash = blockhash(req.blockNumber);
+
+            // The `blockhash` function will return zero if the req.blockNumber is equal to the current
+            // block number, or if it is not within the 256 most recent blocks. This allows the user to
+            // select between two random numbers by executing the reveal function in the same block as the
+            // request, or after 256 blocks. This gives each user two chances to get a favorable result on
+            // each request.
+            // Revert this transaction for when the blockHash is 0;
+            if (_blockHash == bytes32(uint256(0)))
+                revert EntropyErrors.BlockhashUnavailable();
+
+            blockHash = _blockHash;
         }
 
         randomNumber = combineRandomValues(
@@ -246,7 +290,7 @@ contract Entropy is IEntropy, EntropyState {
             randomNumber
         );
 
-        delete _state.requests[key];
+        clearRequest(provider, sequenceNumber);
 
         EntropyStructs.ProviderInfo storage providerInfo = _state.providers[
             provider
@@ -263,25 +307,37 @@ contract Entropy is IEntropy, EntropyState {
         info = _state.providers[provider];
     }
 
+    function getDefaultProvider()
+        public
+        view
+        override
+        returns (address provider)
+    {
+        provider = _state.defaultProvider;
+    }
+
     function getRequest(
         address provider,
         uint64 sequenceNumber
     ) public view override returns (EntropyStructs.Request memory req) {
-        bytes32 key = requestKey(provider, sequenceNumber);
-        req = _state.requests[key];
+        req = findRequest(provider, sequenceNumber);
     }
 
     function getFee(
         address provider
-    ) public view override returns (uint feeAmount) {
+    ) public view override returns (uint128 feeAmount) {
         return _state.providers[provider].feeInWei + _state.pythFeeInWei;
+    }
+
+    function getPythFee() public view returns (uint128 feeAmount) {
+        return _state.pythFeeInWei;
     }
 
     function getAccruedPythFees()
         public
         view
         override
-        returns (uint accruedPythFeesInWei)
+        returns (uint128 accruedPythFeesInWei)
     {
         return _state.accruedPythFeesInWei;
     }
@@ -302,31 +358,90 @@ contract Entropy is IEntropy, EntropyState {
         );
     }
 
-    // Create a unique key for an in-flight randomness request (to store it in the contract state)
+    // Create a unique key for an in-flight randomness request. Returns both a long key for use in the requestsOverflow
+    // mapping and a short key for use in the requests array.
     function requestKey(
         address provider,
         uint64 sequenceNumber
-    ) internal pure returns (bytes32 hash) {
+    ) internal pure returns (bytes32 hash, uint8 shortHash) {
         hash = keccak256(abi.encodePacked(provider, sequenceNumber));
+        shortHash = uint8(hash[0] & NUM_REQUESTS_MASK);
     }
 
-    // Validate that revelation at sequenceNumber is the correct value in the hash chain for a provider whose
-    // last known revealed random number was lastRevelation at lastSequenceNumber.
-    function isProofValid(
-        uint64 lastSequenceNumber,
-        bytes32 lastRevelation,
-        uint64 sequenceNumber,
+    // Construct a provider's commitment given their revealed random number and the distance in the hash chain
+    // between the commitment and the revealed random number.
+    function constructProviderCommitment(
+        uint64 numHashes,
         bytes32 revelation
-    ) internal pure returns (bool valid) {
-        if (sequenceNumber <= lastSequenceNumber)
-            revert EntropyErrors.AssertionFailure();
-
-        bytes32 currentHash = revelation;
-        while (sequenceNumber > lastSequenceNumber) {
+    ) internal pure returns (bytes32 currentHash) {
+        currentHash = revelation;
+        while (numHashes > 0) {
             currentHash = keccak256(bytes.concat(currentHash));
-            sequenceNumber -= 1;
+            numHashes -= 1;
         }
+    }
 
-        valid = currentHash == lastRevelation;
+    // Find an in-flight request.
+    // Note that this method can return requests that are not currently active. The caller is responsible for checking
+    // that the returned request is active (if they care).
+    function findRequest(
+        address provider,
+        uint64 sequenceNumber
+    ) internal view returns (EntropyStructs.Request storage req) {
+        (bytes32 key, uint8 shortKey) = requestKey(provider, sequenceNumber);
+
+        req = _state.requests[shortKey];
+        if (req.provider == provider && req.sequenceNumber == sequenceNumber) {
+            return req;
+        } else {
+            req = _state.requestsOverflow[key];
+        }
+    }
+
+    // Clear the storage for an in-flight request, deleting it from the hash table.
+    function clearRequest(address provider, uint64 sequenceNumber) internal {
+        (bytes32 key, uint8 shortKey) = requestKey(provider, sequenceNumber);
+
+        EntropyStructs.Request storage req = _state.requests[shortKey];
+        if (req.provider == provider && req.sequenceNumber == sequenceNumber) {
+            req.sequenceNumber = 0;
+        } else {
+            delete _state.requestsOverflow[key];
+        }
+    }
+
+    // Allocate storage space for a new in-flight request. This method returns a pointer to a storage slot
+    // that the caller should overwrite with the new request. Note that the memory at this storage slot may
+    // -- and will -- be filled with arbitrary values, so the caller *must* overwrite every field of the returned
+    // struct.
+    function allocRequest(
+        address provider,
+        uint64 sequenceNumber
+    ) internal returns (EntropyStructs.Request storage req) {
+        (, uint8 shortKey) = requestKey(provider, sequenceNumber);
+
+        req = _state.requests[shortKey];
+        if (isActive(req)) {
+            // There's already a prior active request in the storage slot we want to use.
+            // Overflow the prior request to the requestsOverflow mapping.
+            // It is important that this code overflows the *prior* request to the mapping, and not the new request.
+            // There is a chance that some requests never get revealed and remain active forever. We do not want such
+            // requests to fill up all of the space in the array and cause all new requests to incur the higher gas cost
+            // of the mapping.
+            //
+            // This operation is expensive, but should be rare. If overflow happens frequently, increase
+            // the size of the requests array to support more concurrent active requests.
+            (bytes32 reqKey, ) = requestKey(req.provider, req.sequenceNumber);
+            _state.requestsOverflow[reqKey] = req;
+        }
+    }
+
+    // Returns true if a request is active, i.e., its corresponding random value has not yet been revealed.
+    function isActive(
+        EntropyStructs.Request storage req
+    ) internal view returns (bool) {
+        // Note that a provider's initial registration occupies sequence number 0, so there is no way to construct
+        // a randomness request with sequence number 0.
+        return req.sequenceNumber != 0;
     }
 }

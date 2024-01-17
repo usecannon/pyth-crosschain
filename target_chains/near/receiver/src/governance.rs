@@ -32,6 +32,7 @@ use {
         AccountId,
         Gas,
         Promise,
+        PromiseOrValue,
     },
     num_traits::FromPrimitive,
     strum::EnumDiscriminants,
@@ -65,7 +66,8 @@ pub enum GovernanceModule {
 }
 
 /// A `GovernanceAction` represents the different actions that can be voted on and executed by the
-/// governance system.
+/// governance system. Note that this implementation is NEAR specific, for example within the
+/// UpgradeContract variant we use a codehash unlike a code_id in Cosmwasm, or a Pubkey in Solana.
 ///
 /// [ref:chain_structure] This type uses a [u8; 32] for contract upgrades which differs from other
 /// chains, see the reference for more details.
@@ -256,7 +258,7 @@ impl Pyth {
     /// done in a callback handler, see `process_vaa_callback`.
     #[payable]
     #[handle_result]
-    pub fn execute_governance_instruction(&mut self, vaa: String) -> Result<(), Error> {
+    pub fn execute_governance_instruction(&mut self, vaa: String) -> Result<Promise, Error> {
         // Verify the VAA is coming from a trusted source chain before attempting to verify VAA
         // signatures. Avoids a cross-contract call early.
         {
@@ -267,11 +269,6 @@ impl Pyth {
 
             // Convert to local VAA type to catch API changes.
             let vaa = Vaa::from(vaa);
-
-            ensure!(
-                self.executed_governance_vaa < vaa.sequence,
-                VaaVerificationFailed
-            );
 
             // Confirm the VAA is coming from a trusted source chain.
             ensure!(
@@ -285,22 +282,20 @@ impl Pyth {
         }
 
         // Verify VAA and refund the caller in case of failure.
-        ext_wormhole::ext(self.wormhole.clone())
+        Ok(ext_wormhole::ext(self.wormhole.clone())
             .with_static_gas(Gas(30_000_000_000_000))
             .verify_vaa(vaa.clone())
             .then(
                 Self::ext(env::current_account_id())
-                    .with_static_gas(Gas(30_000_000_000_000))
+                    .with_static_gas(Gas(10_000_000_000_000))
                     .with_attached_deposit(env::attached_deposit())
                     .verify_gov_vaa_callback(env::predecessor_account_id(), vaa),
             )
             .then(
                 Self::ext(env::current_account_id())
-                    .with_static_gas(Gas(30_000_000_000_000))
+                    .with_static_gas(Gas(10_000_000_000_000))
                     .refund_vaa(env::predecessor_account_id(), env::attached_deposit()),
-            );
-
-        Ok(())
+            ))
     }
 
     /// Invoke handler upon successful verification of a VAA action.
@@ -316,7 +311,7 @@ impl Pyth {
         account_id: AccountId,
         vaa: String,
         #[callback_result] _result: Result<u32, near_sdk::PromiseError>,
-    ) -> Result<(), Error> {
+    ) -> Result<PromiseOrValue<()>, Error> {
         use GovernanceAction::*;
 
         ensure!(is_promise_success(), VaaVerificationFailed);
@@ -340,14 +335,21 @@ impl Pyth {
             InvalidPayload
         );
 
+        // Ensure the VAA is ahead in sequence, this check is here instead of during
+        // `execute_governance_instruction` as otherwise someone would be able to slip
+        // competing actions into the execution stream before the sequence is updated.
+        ensure!(
+            self.executed_governance_vaa < vaa.sequence,
+            VaaVerificationFailed
+        );
+
+        self.executed_governance_vaa = vaa.sequence;
+
         match GovernanceInstruction::deserialize(rest)?.action {
             SetDataSources { data_sources } => self.set_sources(data_sources),
             SetFee { base, expo } => self.set_update_fee(base, expo)?,
             SetValidPeriod { valid_seconds } => self.set_valid_period(valid_seconds),
             RequestGovernanceDataSourceTransfer { .. } => Err(InvalidPayload)?,
-            AuthorizeGovernanceDataSourceTransfer { claim_vaa } => {
-                self.authorize_gov_source_transfer(claim_vaa)?
-            }
             UpgradeContract { codehash } => {
                 // Additionally restrict to only Near for upgrades. This is a safety measure to
                 // prevent accidental upgrades to the wrong contract.
@@ -357,17 +359,49 @@ impl Pyth {
                 );
                 self.set_upgrade_hash(codehash)
             }
+
+            // In the case of AuthorizeGovernanceDataSourceTransfer we need to verify the VAA
+            // contained within the action. This implies another async call so we return here and
+            // allow the refund / gov processing to happen in the callback.
+            AuthorizeGovernanceDataSourceTransfer { claim_vaa } => {
+                let claim_vaa = hex::encode(claim_vaa);
+
+                // Return early, the callback has to perform the rest of the processing. Normally
+                // VAA processing will complete and the code below this match statement will
+                // execute. But because the VAA verification is async, we must return here instead
+                // and the logic below is duplicated within the authorize_gov_source_transfer function.
+                return Ok(PromiseOrValue::Promise(
+                    ext_wormhole::ext(self.wormhole.clone())
+                        .with_static_gas(Gas(10_000_000_000_000))
+                        .verify_vaa(claim_vaa.clone())
+                        .then(
+                            Self::ext(env::current_account_id())
+                                .with_static_gas(Gas(10_000_000_000_000))
+                                .with_attached_deposit(env::attached_deposit())
+                                .authorize_gov_source_transfer(
+                                    env::predecessor_account_id(),
+                                    claim_vaa,
+                                    storage,
+                                ),
+                        )
+                        .then(
+                            Self::ext(env::current_account_id())
+                                .with_static_gas(Gas(10_000_000_000_000))
+                                .refund_vaa(env::predecessor_account_id(), env::attached_deposit()),
+                        ),
+                ));
+            }
         }
 
-        self.executed_governance_vaa = vaa.sequence;
-
         // Refund storage difference to `account_id` after storage execution.
-        self.refund_storage_usage(
+        Self::refund_storage_usage(
             account_id,
             storage,
             env::storage_usage(),
             env::attached_deposit(),
+            None,
         )
+        .map(|v| PromiseOrValue::Value(v))
     }
 
     /// If submitting an action fails then this callback will refund the caller.
@@ -381,15 +415,21 @@ impl Pyth {
     }
 
     #[private]
-    pub fn set_upgrade_hash(&mut self, codehash: [u8; 32]) {
-        self.codehash = codehash;
-    }
-
-    #[private]
+    #[payable]
     #[handle_result]
-    pub fn authorize_gov_source_transfer(&mut self, claim_vaa: Vec<u8>) -> Result<(), Error> {
+    pub fn authorize_gov_source_transfer(
+        &mut self,
+        account_id: AccountId,
+        claim_vaa: String,
+        storage: u64,
+        #[callback_result] _result: Result<u32, near_sdk::PromiseError>,
+    ) -> Result<(), Error> {
+        // If VAA verification failed we should bail.
+        ensure!(is_promise_success(), VaaVerificationFailed);
+
+        let vaa = hex::decode(claim_vaa).map_err(|_| InvalidPayload)?;
         let (vaa, rest): (wormhole::Vaa<()>, _) =
-            serde_wormhole::from_slice_with_payload(&claim_vaa).expect("Failed to deserialize VAA");
+            serde_wormhole::from_slice_with_payload(&vaa).expect("Failed to deserialize VAA");
 
         // Convert to local VAA type to catch API changes.
         let vaa = Vaa::from(vaa);
@@ -415,7 +455,9 @@ impl Pyth {
                     InvalidPayload
                 );
 
+                // Update executed VAA indices, prevents replay on both the VAA.
                 self.executed_governance_change_vaa = governance_data_source_index as u64;
+                self.executed_governance_vaa = vaa.sequence;
 
                 // Update Governance Source
                 self.gov_source = Source {
@@ -427,35 +469,14 @@ impl Pyth {
             _ => Err(Unknown)?,
         }
 
-        Ok(())
-    }
-
-    #[private]
-    pub fn set_valid_period(&mut self, threshold: u64) {
-        self.stale_threshold = threshold;
-    }
-
-    #[private]
-    #[handle_result]
-    pub fn set_update_fee(&mut self, fee: u64, expo: u64) -> Result<(), Error> {
-        self.update_fee = (fee as u128)
-            .checked_mul(
-                10_u128
-                    .checked_pow(u32::try_from(expo).map_err(|_| ArithmeticOverflow)?)
-                    .ok_or(ArithmeticOverflow)?,
-            )
-            .ok_or(ArithmeticOverflow)?;
-
-        Ok(())
-    }
-
-    #[private]
-    #[handle_result]
-    pub fn set_sources(&mut self, sources: Vec<Source>) {
-        self.sources.clear();
-        sources.iter().for_each(|s| {
-            self.sources.insert(s);
-        });
+        // Refund storage difference to `account_id` after storage execution.
+        Self::refund_storage_usage(
+            account_id,
+            storage,
+            env::storage_usage(),
+            env::attached_deposit(),
+            None,
+        )
     }
 
     /// This method allows self-upgrading the contract to a new implementation.
@@ -469,11 +490,14 @@ impl Pyth {
     /// this method as a normal public method.
     #[handle_result]
     pub(crate) fn upgrade(&mut self, new_code: Vec<u8>) -> Result<Promise, Error> {
-        let signature = env::sha256(&new_code);
+        let signature = TryInto::<[u8; 32]>::try_into(env::sha256(&new_code)).unwrap();
+        let default = <[u8; 32] as Default>::default();
+        ensure!(signature != default, UnauthorizedUpgrade);
         ensure!(signature == self.codehash, UnauthorizedUpgrade);
 
         Ok(Promise::new(env::current_account_id())
             .deploy_contract(new_code)
+            .then(Self::ext(env::current_account_id()).migrate())
             .then(Self::ext(env::current_account_id()).refund_upgrade(
                 env::predecessor_account_id(),
                 env::attached_deposit(),
@@ -491,7 +515,7 @@ impl Pyth {
         amount: u128,
         storage: u64,
     ) -> Result<(), Error> {
-        self.refund_storage_usage(account_id, storage, env::storage_usage(), amount)
+        Self::refund_storage_usage(account_id, storage, env::storage_usage(), amount, None)
     }
 }
 
@@ -501,6 +525,33 @@ impl Pyth {
         (self.gov_source == *source)
             .then_some(())
             .ok_or(UnknownSource(source.emitter))
+    }
+
+    pub fn set_valid_period(&mut self, threshold: u64) {
+        self.stale_threshold = threshold;
+    }
+
+    pub fn set_update_fee(&mut self, fee: u64, expo: u64) -> Result<(), Error> {
+        self.update_fee = (fee as u128)
+            .checked_mul(
+                10_u128
+                    .checked_pow(u32::try_from(expo).map_err(|_| ArithmeticOverflow)?)
+                    .ok_or(ArithmeticOverflow)?,
+            )
+            .ok_or(ArithmeticOverflow)?;
+
+        Ok(())
+    }
+
+    pub fn set_sources(&mut self, sources: Vec<Source>) {
+        self.sources.clear();
+        sources.iter().for_each(|s| {
+            self.sources.insert(s);
+        });
+    }
+
+    pub fn set_upgrade_hash(&mut self, codehash: [u8; 32]) {
+        self.codehash = codehash;
     }
 }
 
@@ -541,7 +592,6 @@ mod tests {
 
         let mut contract = Pyth::new(
             near_sdk::AccountId::new_unchecked("pyth.near".to_owned()),
-            [0; 32],
             Source::default(),
             Source::default(),
             0.into(),
@@ -561,7 +611,6 @@ mod tests {
 
         let mut contract = Pyth::new(
             near_sdk::AccountId::new_unchecked("pyth.near".to_owned()),
-            [0; 32],
             Source::default(),
             Source::default(),
             0.into(),
@@ -580,7 +629,6 @@ mod tests {
 
         let mut contract = Pyth::new(
             near_sdk::AccountId::new_unchecked("pyth.near".to_owned()),
-            [0; 32],
             Source::default(),
             Source::default(),
             0.into(),
@@ -599,7 +647,6 @@ mod tests {
 
         let mut contract = Pyth::new(
             near_sdk::AccountId::new_unchecked("pyth.near".to_owned()),
-            [0; 32],
             Source::default(),
             Source::default(),
             0.into(),

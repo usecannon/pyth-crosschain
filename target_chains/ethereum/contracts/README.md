@@ -4,34 +4,29 @@ This directory contains The Pyth contract on Ethereum and utilities to deploy it
 
 ## Installation
 
-Run the following command on the repo root to install required dependencies for the contract:
+The contracts are built and tested using Foundry. Follow the [Foundry installation instructions](https://book.getfoundry.sh/getting-started/installation) to install it if you do not already have it.
+
+Next, run the following command from the repo root to install required dependencies for the contract:
 
 ```
 npm ci
 npx lerna run build --scope="@pythnetwork/pyth-evm-contract" --include-dependencies
 ```
 
-## Deployment
-
-Please refer to [Deploying.md](./Deploying.md) for more information.
-
-## Foundry
-
-Foundry can be installed by the official installer, or by running our helper script which will automatically pull the correct installation script individually for Foundry and the Solidity compiler for your current OS. This may work better if you are running into networking/firewall issues using Foundry's Solidity installer. To use helper script, run the command below from this directory:
-
-```sh
-pyth-crosschain/target_chains/ethereum/contracts $ bash ../../../scripts/install-foundry.sh
-```
-
-You need to install npm dependencies as described in [Installation](#installation). Also, you need to run the following
-command in the `contracts` directory to install forge dependencies:
+Next, from the `contracts` directory, run the following command to install forge dependencies:
 
 ```
 npm run install-forge-deps
 ```
 
-After installing the dependencies. Run `forge build` to build the contracts and `forge test` to
-test the contracts using tests in `forge-test` directory. To see line by line test coverage:
+## Testing
+
+Run `forge build` to build the contracts and `forge test` to run the contract unit tests.
+The unit tests live in the `forge-test` directory.
+
+### Code Coverage
+
+To see line-by-line test coverage:
 
 ```
 npm run coverage
@@ -61,9 +56,9 @@ cp .env.test .env && npx truffle compile --all && npx truffle migrate
 npm run test-contract
 ```
 
-### Gas Benchmark
+### Gas Benchmarks
 
-You can use foundry to run benchmark tests written in [`forge-test/GasBenchmark.t.sol`](./forge-test/GasBenchmark.t.sol). To run the tests with gas report
+You can use foundry to run gas benchmark tests (which can be found in the `forge-test` directory). To run the tests with gas report
 you can run `forge test --gas-report --match-contract GasBenchmark`. However, as there are multiple benchmarks, this might not be useful. You can run a
 specific benchmark test by passing the test name using `--match-test`. A full command to run `testBenchmarkUpdatePriceFeedsFresh` benchmark test is like this:
 
@@ -93,7 +88,7 @@ A gas report should have a couple of tables like this:
 
 For most of the methods, the minimum gas usage is an indication of our desired gas usage. Because the calls that store something in the storage
 for the first time in `setUp` use significantly more gas. For example, in the above table, there are two calls to `updatePriceFeeds`. The first
-call has happend in the `setUp` method and costed over a million gas and is not intended for our Benchmark. So our desired value is the
+call has happened in the `setUp` method and costed over a million gas and is not intended for our Benchmark. So our desired value is the
 minimum value which is around 380k gas.
 
 If you like to optimize the contract and measure the gas optimization you can get gas snapshots using `forge snapshot` and evaluate your
